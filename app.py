@@ -7,7 +7,7 @@ import uuid
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Behind the Chatbot", page_icon="🤖")
-st.title("🤖 Behind the Chatbot: AI Literacy Activity")
+st.title("🤖 Chat Baht, Chat Bot, Explains Himself")
 
 # Initialize Anthropic Client
 client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
@@ -169,7 +169,7 @@ for message in st.session_state.messages:
             st.markdown(message["content"])
 
 # --- UI: CHAT INPUT & LOGIC ---
-if prompt := st.chat_input("Type your response here..."):
+if prompt := st.chat_input("Talk to me, cool cat!"):
 
     # Save and display user message
     st.chat_message("user").markdown(prompt)
