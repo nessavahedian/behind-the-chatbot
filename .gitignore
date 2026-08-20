@@ -1,0 +1,8 @@
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Python virtual environments and cache
+.venv/
+venv/
+__pycache__/
+.DS_Store
