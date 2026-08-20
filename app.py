@@ -7,7 +7,7 @@ import uuid
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Behind the Chatbot", page_icon="🤖")
-st.title("🤖 Chad Baht, Chat Bot, Explains Himself")
+st.title("🤖 Chad Baht, a chatbot, Explains Himself")
 
 # Initialize Anthropic Client
 client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
