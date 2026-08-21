@@ -199,7 +199,7 @@ message_placeholder.markdown(full_response)
 st.session_state.messages.append({"role": "assistant", "content": full_response})
 
     # Save Transcript to Google Sheets
-    try:
+try:
         sheet = get_google_sheet()
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([
