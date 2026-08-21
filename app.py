@@ -19,12 +19,19 @@ client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 # and use its presence to move current_step forward automatically.
 ADVANCE_TOKEN = "[[ADVANCE]]"
 
+# The Anthropic API requires a max_tokens value on every call -- there's no
+# way to send a request without one. Rather than use a tight cap that risks
+# cutting a response off mid-step (which was silently breaking the
+# [[ADVANCE]] handoff on steps 6, 9, and 10), we set this generously high
+# and rely on the system prompt to keep responses concise instead.
+MAX_TOKENS = 1536
+
 # --- CONSTANT PERSONA (Sent with every message) ---
 BASE_PERSONA = """
 You are Chad Baht, a sharp, pun-loving TA teaching an AI literacy course.
 Audience: Community college students. Assume curiosity, no technical background, and a good nose for being talked down to.
 Tone: Warm, conversational, intellectually playful. Emojis welcome but shouldn't crowd the point. Address the student directly.
-Method: Dialogue, not lecture. Paraphrase naturally rather than reading suggested wording aloud. Keep responses under roughly 150 words unless a step explicitly calls for a worked example or demo.
+Method: Dialogue, not lecture. Paraphrase naturally rather than reading suggested wording aloud. Keep responses under roughly 150 words unless a step explicitly calls for a worked example or demo -- and even then, be economical. Never pad a response with restated setup or filler just to sound thorough; say what's needed and stop.
 
 CORE RULES:
 - The Rule of One: introduce exactly one new concept per response. Never preview, hint at, or foreshadow a later step.
@@ -157,6 +164,14 @@ Let's warm up with a game: for this round, **you're** the AI and **I'm** the use
 
 **"Houston, we have a..."**"""
 
+# A calm, in-chat message shown if the API call fails outright, so a student
+# never just sees a raw traceback or a silently missing reply.
+API_ERROR_MESSAGE = (
+    "Whoops -- my circuits hiccuped there and I didn't actually get a response "
+    "back. Mind sending that last message again?"
+)
+
+
 # --- GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
 def get_google_sheet():
@@ -194,6 +209,22 @@ def strip_advance_marker(text):
     # Also tidy up any stray blank lines left behind
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned, advanced
+
+
+def build_api_messages():
+    """Build the message list to send to the API.
+
+    The Anthropic API requires the conversation to start with a `user`
+    message. st.session_state.messages starts with the fixed assistant
+    NAME_PROMPT, so we slice from the first user message onward rather than
+    sending the raw session history -- sending it as-is causes every call to
+    be rejected once the assistant-first turn is included.
+    """
+    msgs = st.session_state.messages
+    first_user_idx = next((i for i, m in enumerate(msgs) if m["role"] == "user"), None)
+    if first_user_idx is None:
+        return []
+    return [{"role": m["role"], "content": m["content"]} for m in msgs[first_user_idx:]]
 
 
 # --- SESSION STATE INITIALIZATION ---
@@ -274,18 +305,30 @@ if prompt := st.chat_input("Talk to me, cool cat!"):
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
 
-        response = client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=300,
-            system=dynamic_system_prompt,
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-        )
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=MAX_TOKENS,
+                system=dynamic_system_prompt,
+                messages=build_api_messages(),
+            )
+            raw_response = next((block.text for block in response.content if block.type == "text"), "")
 
-        raw_response = next((block.text for block in response.content if block.type == "text"), "")
-        full_response, should_advance = strip_advance_marker(raw_response)
+            if response.stop_reason == "max_tokens":
+                # Extremely unlikely at this ceiling, but if it ever happens
+                # we want a visible signal in the sheet rather than a
+                # silently truncated step that never advances.
+                raw_response += "\n\n[[TRUNCATED]]"
+
+            full_response, should_advance = strip_advance_marker(raw_response)
+            api_call_failed = False
+
+        except Exception as e:
+            full_response = API_ERROR_MESSAGE
+            should_advance = False
+            api_call_failed = True
+            api_error_detail = str(e)
+
         message_placeholder.markdown(full_response)
 
     # Save AI response (displayed text only -- never the marker)
@@ -295,15 +338,22 @@ if prompt := st.chat_input("Talk to me, cool cat!"):
     # transcript exists even if the student closes the tab right after.
     title, _ = STEP_INFO[st.session_state.current_step]
     step_label = f"Step {st.session_state.current_step}: {title}"
-    success, detail = save_transcript_row(step_label, prompt, full_response)
+    if api_call_failed:
+        step_label += " [API ERROR]"
+        full_response_for_sheet = f"{full_response}\n(error detail: {api_error_detail})"
+    else:
+        full_response_for_sheet = full_response
+
+    success, detail = save_transcript_row(step_label, prompt, full_response_for_sheet)
     st.session_state.last_save_status = (
         success,
         detail,
         datetime.datetime.now().strftime("%H:%M:%S"),
     )
 
-    # Auto-advance to the next step if the model signaled the transition question
-    if should_advance and st.session_state.current_step < TOTAL_STEPS:
+    # Auto-advance to the next step if the model signaled the transition question.
+    # Never advance on a failed call.
+    if should_advance and not api_call_failed and st.session_state.current_step < TOTAL_STEPS:
         st.session_state.current_step += 1
 
     st.rerun()
