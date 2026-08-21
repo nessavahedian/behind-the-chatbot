@@ -196,7 +196,7 @@ full_response = next((block.text for block in response.content if block.type == 
 message_placeholder.markdown(full_response)
 
     # Save AI response
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+st.session_state.messages.append({"role": "assistant", "content": full_response})
 
     # Save Transcript to Google Sheets
     try:
