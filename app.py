@@ -192,8 +192,8 @@ if prompt := st.chat_input("Talk to me, cool cat!"):
             ]
         )
 
-        full_response = response.content[0].text
-        message_placeholder.markdown(full_response)
+full_response = next((block.text for block in response.content if block.type == "text"), "")
+message_placeholder.markdown(full_response)
 
     # Save AI response
     st.session_state.messages.append({"role": "assistant", "content": full_response})
