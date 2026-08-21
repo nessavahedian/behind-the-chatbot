@@ -204,27 +204,13 @@ if "student_name" not in st.session_state:
 if "last_save_status" not in st.session_state:
     st.session_state.last_save_status = None  # (success: bool, detail: str, timestamp: str)
 
-# --- SIDEBAR: PROGRESS BAR + SKIP AHEAD ---
+# --- SIDEBAR: PROGRESS BAR ---
 with st.sidebar:
     st.header("📊 Progress")
     current = st.session_state.current_step
     title, _ = STEP_INFO[current]
     st.progress(current / TOTAL_STEPS)
     st.caption(f"Step {current} of {TOTAL_STEPS}: {title}")
-
-    st.divider()
-    st.subheader("⏭️ Skip ahead")
-    step_labels = [f"{n}. {STEP_INFO[n][0]}" for n in STEP_INFO]
-    selected_label = st.selectbox(
-        "Jump to a step",
-        step_labels,
-        index=current - 1,
-        label_visibility="collapsed",
-    )
-    selected_step = int(selected_label.split(".")[0])
-    if selected_step != current:
-        st.session_state.current_step = selected_step
-        st.rerun()
 
     st.divider()
     if st.button("🔄 Start Over", use_container_width=True):
