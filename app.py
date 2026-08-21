@@ -1,30 +1,31 @@
-import streamlit as st
+import os
+import re
+import uuid
+import asyncio
+import datetime
+
+import chainlit as cl
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
-import datetime
-import uuid
-import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Behind the Chatbot", page_icon="🤖")
-st.title("🤖 Chad Baht, a chatbot, Explains Himself")
+# Anthropic client -- reads ANTHROPIC_API_KEY from the environment.
+# Set this in a .env file (see .env.example) or your host's env var settings.
+client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Initialize Anthropic Client
-client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+# The Anthropic API requires a max_tokens value on every call -- it can't be
+# omitted. We set it generously high so it essentially never truncates a real
+# response, and rely on the system prompt to keep responses concise instead.
+MAX_TOKENS = 1536
 
-# --- ADVANCE MARKER ---
 # The model appends this exact token when (and only when) it asks the final
 # transition question for the CURRENT step. We strip it before displaying
-# and use its presence to move current_step forward automatically.
+# and use its presence to move current_step forward.
 ADVANCE_TOKEN = "[[ADVANCE]]"
 
-# The Anthropic API requires a max_tokens value on every call -- there's no
-# way to send a request without one. Rather than use a tight cap that risks
-# cutting a response off mid-step (which was silently breaking the
-# [[ADVANCE]] handoff on steps 6, 9, and 10), we set this generously high
-# and rely on the system prompt to keep responses concise instead.
-MAX_TOKENS = 1536
+GSHEET_NAME = os.environ.get("GSHEET_NAME")  # optional -- logging is skipped if unset
+
 
 # --- CONSTANT PERSONA (Sent with every message) ---
 BASE_PERSONA = """
@@ -137,17 +138,17 @@ SCRIPT_STEPS = {
 }
 
 STEP_INFO = {
-    1: ("The Prediction Game", "How AI predicts the next word using probability."),
-    2: ("Training Data", "Where AI's patterns come from -- including Reddit and today's crawler-blocking problem."),
-    3: ("Tokens", "Why early AI couldn't count the r's in strawberry, and how text gets chopped into chunks."),
-    4: ("Vector Space & Embeddings", "\"Word math\" -- how AI maps meaning as coordinates in space."),
-    5: ("Polysemy & Attention", "How AI figures out which meaning of a word you intend, and why long chats get shakier."),
-    6: ("Temperature", "The dial that controls how random or predictable AI responses are."),
-    7: ("RLHF", "How human feedback trains AI's behavior -- like training a dog."),
-    8: ("Parametric vs. RAG Memory", "What AI already \"knows\" vs. what it looks up -- and why that's not a full fix."),
-    9: ("The Black Box", "How hidden bias creeps into AI decisions -- and why that's not a new problem."),
-    10: ("Hallucination", "Why AI confidently makes things up, and how to catch it."),
-    11: ("The Human Expert", "Wrapping up: what's still your job as the critical thinker in the room."),
+    1: "The Prediction Game",
+    2: "Training Data",
+    3: "Tokens",
+    4: "Vector Space & Embeddings",
+    5: "Polysemy & Attention",
+    6: "Temperature",
+    7: "RLHF",
+    8: "Parametric vs. RAG Memory",
+    9: "The Black Box",
+    10: "Hallucination",
+    11: "The Human Expert",
 }
 
 TOTAL_STEPS = len(STEP_INFO)
@@ -164,37 +165,39 @@ Let's warm up with a game: for this round, **you're** the AI and **I'm** the use
 
 **"Houston, we have a..."**"""
 
-# A calm, in-chat message shown if the API call fails outright, so a student
-# never just sees a raw traceback or a silently missing reply.
 API_ERROR_MESSAGE = (
     "Whoops -- my circuits hiccuped there and I didn't actually get a response "
     "back. Mind sending that last message again?"
 )
 
 
-# --- GOOGLE SHEETS CONNECTION ---
-@st.cache_resource
-def get_google_sheet():
+# --- GOOGLE SHEETS (optional logging) ---
+_sheet = None
+
+
+def _get_sheet():
+    """Lazily connect to Google Sheets. Returns None if not configured."""
+    global _sheet
+    if _sheet is not None:
+        return _sheet
+    if not GSHEET_NAME or not os.environ.get("GCP_SERVICE_ACCOUNT_JSON"):
+        return None
+    import json
+
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+    info = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+    credentials = Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(credentials)
-    return gc.open(st.secrets["GSHEET_NAME"]).sheet1
+    _sheet = gc.open(GSHEET_NAME).sheet1
+    return _sheet
 
 
-def save_transcript_row(label, user_text, assistant_text):
-    """Append one Q&A turn to the Google Sheet.
-
-    Sheet columns are: Timestamp | ID | Transcript
-    - ID is the name the student gave us (falls back to the session code if
-      they somehow haven't been asked yet).
-    - Transcript combines the step label with both sides of this turn, so a
-      single 3-column row still tells the full story of that exchange.
-    Returns (success, error_message).
-    """
+def _append_row_blocking(student_id, label, user_text, assistant_text):
+    sheet = _get_sheet()
+    if sheet is None:
+        return False, "Google Sheets not configured (skipped)"
     try:
-        sheet = get_google_sheet()
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        student_id = st.session_state.get("student_name") or st.session_state.session_id
         transcript_text = f"[{label}]\nStudent: {user_text}\nChad: {assistant_text}"
         sheet.append_row([timestamp, student_id, transcript_text])
         return True, None
@@ -202,158 +205,97 @@ def save_transcript_row(label, user_text, assistant_text):
         return False, str(e)
 
 
+async def save_transcript_row(label, user_text, assistant_text):
+    """Non-blocking wrapper -- gspread is a synchronous library, so we run it
+    in a worker thread rather than blocking Chainlit's async event loop."""
+    student_id = cl.user_session.get("student_name") or cl.user_session.get("session_id")
+    success, detail = await asyncio.to_thread(
+        _append_row_blocking, student_id, label, user_text, assistant_text
+    )
+    if not success and detail != "Google Sheets not configured (skipped)":
+        print(f"[transcript save failed] {detail}")
+
+
 def strip_advance_marker(text):
-    """Remove the [[ADVANCE]] token from model output and report whether it was present."""
     advanced = ADVANCE_TOKEN in text
     cleaned = text.replace(ADVANCE_TOKEN, "").strip()
-    # Also tidy up any stray blank lines left behind
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned, advanced
 
 
-def build_api_messages():
-    """Build the message list to send to the API.
+# --- CHAINLIT LIFECYCLE ---
 
-    The Anthropic API requires the conversation to start with a `user`
-    message. st.session_state.messages starts with the fixed assistant
-    NAME_PROMPT, so we slice from the first user message onward rather than
-    sending the raw session history -- sending it as-is causes every call to
-    be rejected once the assistant-first turn is included.
-    """
-    msgs = st.session_state.messages
-    first_user_idx = next((i for i, m in enumerate(msgs) if m["role"] == "user"), None)
-    if first_user_idx is None:
-        return []
-    return [{"role": m["role"], "content": m["content"]} for m in msgs[first_user_idx:]]
+@cl.on_chat_start
+async def start():
+    # Chainlit gives each connected user their own persistent session --
+    # no full-script rerun, no reconstructing state from scratch on every
+    # message. This dict lives for the life of the session.
+    cl.user_session.set("session_id", str(uuid.uuid4())[:8])
+    cl.user_session.set("current_step", 1)
+    cl.user_session.set("student_name", None)
+    cl.user_session.set("messages", [])  # API-formatted conversation history
+
+    await cl.Message(content=NAME_PROMPT, author="Chad Baht").send()
 
 
-# --- SESSION STATE INITIALIZATION ---
-if "messages" not in st.session_state:
-    # First turn just asks the student's name -- no API call needed, it's fixed text.
-    st.session_state.messages = [{"role": "assistant", "content": NAME_PROMPT}]
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())[:8]
-if "current_step" not in st.session_state:
-    st.session_state.current_step = 1
-if "student_name" not in st.session_state:
-    st.session_state.student_name = None
-if "last_save_status" not in st.session_state:
-    st.session_state.last_save_status = None  # (success: bool, detail: str, timestamp: str)
+@cl.on_message
+async def main(message: cl.Message):
+    prompt = message.content
+    student_name = cl.user_session.get("student_name")
 
-# --- SIDEBAR: PROGRESS BAR ---
-with st.sidebar:
-    st.header("📊 Progress")
-    current = st.session_state.current_step
-    title, _ = STEP_INFO[current]
-    st.progress(current / TOTAL_STEPS)
-    st.caption(f"Step {current} of {TOTAL_STEPS}: {title}")
+    # --- Name collection turn (no API call needed) ---
+    if student_name is None:
+        name = prompt.strip()[:60]
+        cl.user_session.set("student_name", name)
 
-    st.divider()
-    if st.button("🔄 Start Over", use_container_width=True):
-        st.session_state.messages = [{"role": "assistant", "content": NAME_PROMPT}]
-        st.session_state.current_step = 1
-        st.session_state.session_id = str(uuid.uuid4())[:8]
-        st.session_state.student_name = None
-        st.session_state.last_save_status = None
-        st.rerun()
+        await cl.Message(content=INTRO_MESSAGE, author="Chad Baht").send()
+        await save_transcript_row("Intro", f"Wants to be called: {name}", INTRO_MESSAGE)
+        return
 
-    st.divider()
-    # Visible save status so failures are never silent again
-    if st.session_state.last_save_status is not None:
-        success, detail, ts = st.session_state.last_save_status
-        if success:
-            st.caption(f"✅ Transcript saved at {ts}")
-        else:
-            st.caption(f"⚠️ Save failed at {ts}")
-            st.caption(f"`{detail}`")
+    # --- Regular step turn ---
+    history = cl.user_session.get("messages")
+    history.append({"role": "user", "content": prompt})
 
-# --- UI: DISPLAY CHAT HISTORY ---
-for message in st.session_state.messages:
-    if message["role"] != "system":
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    current_step = cl.user_session.get("current_step")
+    dynamic_system_prompt = BASE_PERSONA + "\n\n" + SCRIPT_STEPS[current_step]
 
-# --- UI: CHAT INPUT & LOGIC ---
-if prompt := st.chat_input("Talk to me, cool cat!"):
-
-    # Save and display user message
-    st.chat_message("user").markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    if st.session_state.student_name is None:
-        # This turn is the student's answer to "what should I call you?" --
-        # no API call needed, just record the name and hand off to the game intro.
-        name = prompt.strip()[:60]  # keep it short and sane for a sheet cell
-        st.session_state.student_name = name
-
-        with st.chat_message("assistant"):
-            st.markdown(INTRO_MESSAGE)
-        st.session_state.messages.append({"role": "assistant", "content": INTRO_MESSAGE})
-
-        success, detail = save_transcript_row("Intro", f"Wants to be called: {name}", INTRO_MESSAGE)
-        st.session_state.last_save_status = (
-            success,
-            detail,
-            datetime.datetime.now().strftime("%H:%M:%S"),
+    try:
+        response = await client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=MAX_TOKENS,
+            system=dynamic_system_prompt,
+            messages=history,
         )
-        st.rerun()
+        raw_response = next((b.text for b in response.content if b.type == "text"), "")
+        if response.stop_reason == "max_tokens":
+            raw_response += "\n\n[[TRUNCATED]]"
+        full_response, should_advance = strip_advance_marker(raw_response)
+        api_call_failed = False
+        api_error_detail = None
+    except Exception as e:
+        full_response = API_ERROR_MESSAGE
+        should_advance = False
+        api_call_failed = True
+        api_error_detail = str(e)
+        # Don't leave the user's turn dangling in history if the call failed --
+        # pull it back out so the next retry doesn't send a broken pair.
+        history.pop()
 
-    # Dynamically build the system prompt for THIS specific step
-    dynamic_system_prompt = BASE_PERSONA + "\n\n" + SCRIPT_STEPS[st.session_state.current_step]
+    await cl.Message(content=full_response, author="Chad Baht").send()
 
-    # Get AI Response
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
+    if not api_call_failed:
+        history.append({"role": "assistant", "content": full_response})
+    cl.user_session.set("messages", history)
 
-        try:
-            response = client.messages.create(
-                model="claude-sonnet-5",
-                max_tokens=MAX_TOKENS,
-                system=dynamic_system_prompt,
-                messages=build_api_messages(),
-            )
-            raw_response = next((block.text for block in response.content if block.type == "text"), "")
-
-            if response.stop_reason == "max_tokens":
-                # Extremely unlikely at this ceiling, but if it ever happens
-                # we want a visible signal in the sheet rather than a
-                # silently truncated step that never advances.
-                raw_response += "\n\n[[TRUNCATED]]"
-
-            full_response, should_advance = strip_advance_marker(raw_response)
-            api_call_failed = False
-
-        except Exception as e:
-            full_response = API_ERROR_MESSAGE
-            should_advance = False
-            api_call_failed = True
-            api_error_detail = str(e)
-
-        message_placeholder.markdown(full_response)
-
-    # Save AI response (displayed text only -- never the marker)
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-    # Save this turn to Google Sheets immediately -- this is what makes sure a
-    # transcript exists even if the student closes the tab right after.
-    title, _ = STEP_INFO[st.session_state.current_step]
-    step_label = f"Step {st.session_state.current_step}: {title}"
+    # --- Log to sheet (non-blocking) ---
+    step_label = f"Step {current_step}: {STEP_INFO[current_step]}"
     if api_call_failed:
         step_label += " [API ERROR]"
-        full_response_for_sheet = f"{full_response}\n(error detail: {api_error_detail})"
+        logged_response = f"{full_response}\n(error detail: {api_error_detail})"
     else:
-        full_response_for_sheet = full_response
+        logged_response = full_response
+    await save_transcript_row(step_label, prompt, logged_response)
 
-    success, detail = save_transcript_row(step_label, prompt, full_response_for_sheet)
-    st.session_state.last_save_status = (
-        success,
-        detail,
-        datetime.datetime.now().strftime("%H:%M:%S"),
-    )
-
-    # Auto-advance to the next step if the model signaled the transition question.
-    # Never advance on a failed call.
-    if should_advance and not api_call_failed and st.session_state.current_step < TOTAL_STEPS:
-        st.session_state.current_step += 1
-
-    st.rerun()
+    # --- Advance step ---
+    if should_advance and not api_call_failed and current_step < TOTAL_STEPS:
+        cl.user_session.set("current_step", current_step + 1)
