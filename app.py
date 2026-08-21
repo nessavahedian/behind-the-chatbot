@@ -209,5 +209,5 @@ try:
             prompt,
             full_response
         ])
-    except Exception as e:
+except Exception as e:
         print(f"Error saving to Google Sheets: {e}")
