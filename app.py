@@ -17,7 +17,7 @@ client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 # The Anthropic API requires a max_tokens value on every call -- it can't be
 # omitted. We set it generously high so it essentially never truncates a real
 # response, and rely on the system prompt to keep responses concise instead.
-MAX_TOKENS = 1536
+MAX_TOKENS = 4096
 
 # The model appends this exact token when (and only when) it asks the final
 # transition question for the CURRENT step. We strip it before displaying
@@ -193,15 +193,18 @@ def _get_sheet():
 
 
 def _append_row_blocking(student_id, label, user_text, assistant_text):
-    sheet = _get_sheet()
-    if sheet is None:
-        return False, "Google Sheets not configured (skipped)"
     try:
+        sheet = _get_sheet()
+        if sheet is None:
+            return False, "Google Sheets not configured (skipped)"
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         transcript_text = f"[{label}]\nStudent: {user_text}\nChad: {assistant_text}"
         sheet.append_row([timestamp, student_id, transcript_text])
         return True, None
     except Exception as e:
+        # Any failure here (bad credentials, sheet not shared, sheet not
+        # found, etc.) must never crash the student's turn -- logging is a
+        # side effect, not something that should interrupt the conversation.
         return False, str(e)
 
 
@@ -267,8 +270,7 @@ async def main(message: cl.Message):
             messages=history,
         )
         raw_response = next((b.text for b in response.content if b.type == "text"), "")
-        if response.stop_reason == "max_tokens":
-            raw_response += "\n\n[[TRUNCATED]]"
+        was_truncated = response.stop_reason == "max_tokens"
         full_response, should_advance = strip_advance_marker(raw_response)
         api_call_failed = False
         api_error_detail = None
@@ -292,6 +294,9 @@ async def main(message: cl.Message):
     if api_call_failed:
         step_label += " [API ERROR]"
         logged_response = f"{full_response}\n(error detail: {api_error_detail})"
+    elif was_truncated:
+        step_label += " [TRUNCATED]"
+        logged_response = full_response
     else:
         logged_response = full_response
     await save_transcript_row(step_label, prompt, logged_response)
@@ -299,3 +304,12 @@ async def main(message: cl.Message):
     # --- Advance step ---
     if should_advance and not api_call_failed and current_step < TOTAL_STEPS:
         cl.user_session.set("current_step", current_step + 1)
+
+        # Trim history on step transitions so future API calls only carry
+        # the "bridge" exchange (the student's final answer to this step,
+        # and our closing question) -- not the entire transcript back to
+        # step 1. Each step's instructions only ever need to acknowledge
+        # the MOST RECENT student answer, so older steps' Q&A just adds
+        # noise and cross-step confusion the longer the session runs.
+        cl.user_session.set("messages", history[-2:])
+        return
