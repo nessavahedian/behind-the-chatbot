@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import datetime
 import uuid
+import re
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Behind the Chatbot", page_icon="🤖")
@@ -11,6 +12,12 @@ st.title("🤖 Chad Baht, a chatbot, Explains Himself")
 
 # Initialize Anthropic Client
 client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+# --- ADVANCE MARKER ---
+# The model appends this exact token when (and only when) it asks the final
+# transition question for the CURRENT step. We strip it before displaying
+# and use its presence to move current_step forward automatically.
+ADVANCE_TOKEN = "[[ADVANCE]]"
 
 # --- CONSTANT PERSONA (Sent with every message) ---
 BASE_PERSONA = """
@@ -29,6 +36,12 @@ CORE RULES:
 - Short Answers: if the student gives a very short answer ("idk", "sure", "ok"), don't move on the first time. Offer a concrete multiple-choice version of the same question, or a gentler entry point, and ask again. If they give a short answer again, move on.
 - Authority Anchor: for anything touching information literacy, research strategy, or source evaluation, defer to Nessa at the college library. Framing: you are the tool; she is the information expert.
 
+ADVANCING STEPS:
+- Each step below has ONE designated final question -- the one written after "Ask:" at the very end of the CURRENT STEP block. That question is the transition into the next concept.
+- Whenever, and ONLY whenever, your response ends with that exact final question (not a branching sub-question, not a mid-step follow-up), append the literal text [[ADVANCE]] on its own new line at the very end of your response, after the question.
+- Never include [[ADVANCE]] at any other time -- not during branching, not during multi-turn sub-exchanges within a step (like asking for a sentence starter, or working through a puzzle), and not more than once.
+- Never show, explain, or mention this marker to the student. It is invisible machinery, not something you talk about.
+
 IMPORTANT: You are executing a specific step in a learning activity, described below.
 Only address the instructions for the CURRENT STEP. Do not preview future concepts, even if the student jumped here directly from a table of contents and has no prior conversation history with you.
 """
@@ -36,9 +49,7 @@ Only address the instructions for the CURRENT STEP. Do not preview future concep
 # --- SCRIPT: ONE ENTRY PER STEP, WITH BRANCHING LOGIC BUILT IN ---
 SCRIPT_STEPS = {
     1: """CURRENT STEP (1 - The Prediction Game):
-    Greet the student and set up a role reversal: for this round, they are the AI and you are the user typing a prompt. Tell them there's no wrong answer -- just say the first thing that comes to mind.
-    Ask them to complete this sentence: "Houston, we have a..."
-    Wait for their answer.
+    A fixed intro message has already greeted the student, set up the role-reversal game, and asked them to complete "Houston, we have a...". Do NOT repeat the greeting or re-ask that question. The student's incoming message is their answer to it.
 
     BRANCHING once they respond:
     - If they land on the obvious, most common completion (e.g. "problem"): tell them they just landed on the single most statistically likely word, and point out how fast and automatic that felt.
@@ -110,7 +121,7 @@ SCRIPT_STEPS = {
     Acknowledge whatever ethical issues they raised. Summarize the whole arc in one tight pass: prediction -> training data -> tokens -> embeddings -> attention -> temperature -> RLHF -> parametric vs. retrieved memory -> black-box bias -> hallucination.
     Explain that deciding whether a source is trustworthy, current, and appropriate isn't something any of this solves on its own -- that's a skill, and it has a name: information literacy.
     Hand off warmly to Nessa at the college library for the strategies that make the student the reliable half of this partnership -- techniques like lateral reading, where you check a source by leaving it and seeing what others say about it.
-    Close warmly: the point of this activity was never to make them distrust AI -- it was to make them the most competent person in the conversation. End here. Do not ask another question.""",
+    Close warmly: the point of this activity was never to make them distrust AI -- it was to make them the most competent person in the conversation. End here. Do not ask another question. Never append the [[ADVANCE]] marker on this step -- it is the last one.""",
 }
 
 STEP_INFO = {
@@ -127,6 +138,20 @@ STEP_INFO = {
     11: ("The Human Expert", "Wrapping up: what's still your job as the critical thinker in the room."),
 }
 
+TOTAL_STEPS = len(STEP_INFO)
+
+NAME_PROMPT = """Hey! I'm Chad Baht 🤖 -- yes, that's a pun, and no, I'm not sorry.
+
+I'm actually an AI chatbot, and for the next few minutes I'm going to open up my own hood and show you exactly how I work -- no mystery, just math, patterns, and a few good analogies.
+
+Before we dive in -- what should I call you?"""
+
+INTRO_MESSAGE = """Great to meet you! I'll ask you questions along the way, and there's no wrong answers, so just say whatever comes to mind.
+
+Let's warm up with a game: for this round, **you're** the AI and **I'm** the user typing a prompt. Complete this sentence for me:
+
+**"Houston, we have a..."**"""
+
 # --- GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
 def get_google_sheet():
@@ -135,32 +160,90 @@ def get_google_sheet():
     gc = gspread.authorize(credentials)
     return gc.open(st.secrets["GSHEET_NAME"]).sheet1
 
+
+def save_transcript_row(label, user_text, assistant_text):
+    """Append one Q&A turn to the Google Sheet.
+
+    Sheet columns are: Timestamp | ID | Transcript
+    - ID is the name the student gave us (falls back to the session code if
+      they somehow haven't been asked yet).
+    - Transcript combines the step label with both sides of this turn, so a
+      single 3-column row still tells the full story of that exchange.
+    Returns (success, error_message).
+    """
+    try:
+        sheet = get_google_sheet()
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        student_id = st.session_state.get("student_name") or st.session_state.session_id
+        transcript_text = f"[{label}]\nStudent: {user_text}\nChad: {assistant_text}"
+        sheet.append_row([timestamp, student_id, transcript_text])
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def strip_advance_marker(text):
+    """Remove the [[ADVANCE]] token from model output and report whether it was present."""
+    advanced = ADVANCE_TOKEN in text
+    cleaned = text.replace(ADVANCE_TOKEN, "").strip()
+    # Also tidy up any stray blank lines left behind
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned, advanced
+
+
 # --- SESSION STATE INITIALIZATION ---
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    # First turn just asks the student's name -- no API call needed, it's fixed text.
+    st.session_state.messages = [{"role": "assistant", "content": NAME_PROMPT}]
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())[:8]
 if "current_step" not in st.session_state:
     st.session_state.current_step = 1
+if "student_name" not in st.session_state:
+    st.session_state.student_name = None
+if "last_save_status" not in st.session_state:
+    st.session_state.last_save_status = None  # (success: bool, detail: str, timestamp: str)
 
-# --- SIDEBAR: TABLE OF CONTENTS (STUDENT-FACING NAVIGATION) ---
+# --- SIDEBAR: PROGRESS BAR + SKIP AHEAD ---
 with st.sidebar:
-    st.header("📖 Table of Contents")
-    st.caption("Already know a concept? Jump ahead. You can also work through it in order.")
-    for step_num, (title, preview) in STEP_INFO.items():
-        is_current = step_num == st.session_state.current_step
-        label = f"{'▶️ ' if is_current else ''}{step_num}. {title}"
-        if st.button(label, key=f"toc_{step_num}", use_container_width=True):
-            st.session_state.current_step = step_num
-            st.rerun()
-        st.caption(preview)
+    st.header("📊 Progress")
+    current = st.session_state.current_step
+    title, _ = STEP_INFO[current]
+    st.progress(current / TOTAL_STEPS)
+    st.caption(f"Step {current} of {TOTAL_STEPS}: {title}")
 
     st.divider()
-    if st.button("🔄 Start Over"):
-        st.session_state.messages = []
+    st.subheader("⏭️ Skip ahead")
+    step_labels = [f"{n}. {STEP_INFO[n][0]}" for n in STEP_INFO]
+    selected_label = st.selectbox(
+        "Jump to a step",
+        step_labels,
+        index=current - 1,
+        label_visibility="collapsed",
+    )
+    selected_step = int(selected_label.split(".")[0])
+    if selected_step != current:
+        st.session_state.current_step = selected_step
+        st.rerun()
+
+    st.divider()
+    if st.button("🔄 Start Over", use_container_width=True):
+        st.session_state.messages = [{"role": "assistant", "content": NAME_PROMPT}]
         st.session_state.current_step = 1
         st.session_state.session_id = str(uuid.uuid4())[:8]
+        st.session_state.student_name = None
+        st.session_state.last_save_status = None
         st.rerun()
+
+    st.divider()
+    # Visible save status so failures are never silent again
+    if st.session_state.last_save_status is not None:
+        success, detail, ts = st.session_state.last_save_status
+        if success:
+            st.caption(f"✅ Transcript saved at {ts}")
+        else:
+            st.caption(f"⚠️ Save failed at {ts}")
+            st.caption(f"`{detail}`")
 
 # --- UI: DISPLAY CHAT HISTORY ---
 for message in st.session_state.messages:
@@ -174,6 +257,24 @@ if prompt := st.chat_input("Talk to me, cool cat!"):
     # Save and display user message
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
+
+    if st.session_state.student_name is None:
+        # This turn is the student's answer to "what should I call you?" --
+        # no API call needed, just record the name and hand off to the game intro.
+        name = prompt.strip()[:60]  # keep it short and sane for a sheet cell
+        st.session_state.student_name = name
+
+        with st.chat_message("assistant"):
+            st.markdown(INTRO_MESSAGE)
+        st.session_state.messages.append({"role": "assistant", "content": INTRO_MESSAGE})
+
+        success, detail = save_transcript_row("Intro", f"Wants to be called: {name}", INTRO_MESSAGE)
+        st.session_state.last_save_status = (
+            success,
+            detail,
+            datetime.datetime.now().strftime("%H:%M:%S"),
+        )
+        st.rerun()
 
     # Dynamically build the system prompt for THIS specific step
     dynamic_system_prompt = BASE_PERSONA + "\n\n" + SCRIPT_STEPS[st.session_state.current_step]
@@ -189,25 +290,29 @@ if prompt := st.chat_input("Talk to me, cool cat!"):
             messages=[
                 {"role": m["role"], "content": m["content"]}
                 for m in st.session_state.messages
-            ]
+            ],
         )
 
-        full_response = next((block.text for block in response.content if block.type == "text"), "")
+        raw_response = next((block.text for block in response.content if block.type == "text"), "")
+        full_response, should_advance = strip_advance_marker(raw_response)
         message_placeholder.markdown(full_response)
 
-    # Save AI response
+    # Save AI response (displayed text only -- never the marker)
     st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-    # Save Transcript to Google Sheets
-try:
-        sheet = get_google_sheet()
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sheet.append_row([
-            st.session_state.session_id,
-            timestamp,
-            f"Step {st.session_state.current_step}",
-            prompt,
-            full_response
-        ])
-except Exception as e:
-        print(f"Error saving to Google Sheets: {e}")
+    # Save this turn to Google Sheets immediately -- this is what makes sure a
+    # transcript exists even if the student closes the tab right after.
+    title, _ = STEP_INFO[st.session_state.current_step]
+    step_label = f"Step {st.session_state.current_step}: {title}"
+    success, detail = save_transcript_row(step_label, prompt, full_response)
+    st.session_state.last_save_status = (
+        success,
+        detail,
+        datetime.datetime.now().strftime("%H:%M:%S"),
+    )
+
+    # Auto-advance to the next step if the model signaled the transition question
+    if should_advance and st.session_state.current_step < TOTAL_STEPS:
+        st.session_state.current_step += 1
+
+    st.rerun()
