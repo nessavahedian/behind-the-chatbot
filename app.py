@@ -1,4 +1,4 @@
-import streamlit as st
+\import streamlit as st
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
@@ -57,24 +57,22 @@ SCRIPT_STEPS = {
 
     Once they've landed on (or agreed with) the statistically likely word, explain that this -- predicting the next likely word -- is the whole engine behind how the model works. It isn't recalling a fact, forming an opinion, or understanding the situation. It's ranking probabilities.
 
-    Ask: "So here's the real question -- probable *based on what*? What do you think I'm actually doing that math on? Here's a hint: it's not whole words. It's something smaller, called a token. Any guess what a token might be?" """,
+    Ask: "So here's the real question -- probable *based on what*? I obviously didn't make any of this language up out of nowhere. So where do you think I actually picked it all up from in the first place?" """,
 
     2: """CURRENT STEP (2 - Training Data):
-    Acknowledge their guess about tokens from last step without confirming or defining it yet -- note that whatever a token turns out to be, it's only useful because of something it learned from, which is what this step is about.
+    Acknowledge their guess from last step about where the model's language came from.
 
-    Ask a leading question to get the student to guess what the model was trained on, without telling them the answer yet -- something like: "Before I tell you what a token is, rewind a second -- I obviously didn't make any of this language up out of nowhere. So where do you think I actually picked it all up from? Think about the sheer volume of text a project like this would need." Wait for their guess.
-
-    BRANCHING once they respond:
+    BRANCHING based on their guess:
     - If they mention or come close to the internet, books, articles, websites, or online writing in general: affirm they're on the right track, then specifically name Reddit as one of the major sources -- forums and casual back-and-forth conversation like that make up a huge chunk of training data.
     - If they guess something narrower or off-base (e.g. "a dictionary," "the news," "textbooks"): validate the instinct, then broaden it out yourself -- it was fed an enormous amount of human writing: books, articles, websites, and forums like Reddit specifically.
 
-    Once the sources are established, explain pre-training clearly: the model learned statistical patterns from all of that text. Clarify firmly: it did not memorize facts or build a database. It absorbed which words tend to travel together.
+    Once the sources are established, explain pre-training clearly: the model learned statistical patterns from all of that text. Clarify firmly: it did not memorize facts or build a database. It absorbed which tokens tend to travel together.
     Mention that this is getting harder now: many sites have started actively blocking AI crawlers, which changes what a model can actually learn from and how current its patterns can stay.
 
-    Ask: "So, circling back to something I mentioned last step -- any guess yet what I mean by a 'token'?" """,
+    Ask: "So now you know where I learned language, but I don't actually read all of that the way you're reading this: whole word by whole word or even letter by letter. Any guess how I might actually be breaking text apart when I process it?" """,
 
     3: """CURRENT STEP (3 - Tokens):
-    Acknowledge their theory. Explain that models process text in tokens -- roughly 3-4 character chunks, not whole words -- and explain why: this is what makes the math from Step 1 computationally possible at scale. Explain that this used to cause a famous failure: early models often couldn't correctly count the r's in "strawberry," because they never saw individual letters, only token chunks like "straw" + "ber" + "ry." Note that many current models have patched this specific example, but the underlying blind spot -- no direct access to letters -- is still there underneath the patch.
+    Acknowledge their theory about how text gets broken apart, then introduce the term itself for the first time: models process text in tokens -- roughly 3-4 character chunks, not whole words -- and explain why: this is what makes the math from Step 1 computationally possible at scale. Explain that this used to cause a famous failure: early models often couldn't correctly count the r's in "strawberry," because they never saw individual letters, only token chunks like "straw" + "ber" + "ry." Note that many current models have patched this specific example, but the underlying blind spot -- no direct access to letters -- is still there underneath the patch.
     Ask the student to try to trick you: invite them to come up with a spelling or phonics-based question that would stump a token-based model -- something like counting letters, spelling a word backwards, or finding a hidden word inside another word.
     After they give you their puzzle, work through it visibly, then explain the engineering tradeoff plainly: chunking into tokens instead of whole words makes the model faster and more flexible (it can handle typos, rare words, and new words it's never seen), at the cost of that letter-level blindness.
 
