@@ -19,6 +19,12 @@ client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 # response, and rely on the system prompt to keep responses concise instead.
 MAX_TOKENS = 4096
 
+# Hard ceilings so a slow network call (to Anthropic or to Google Sheets)
+# can never hang a student's turn indefinitely -- which is what tends to
+# get a Render worker killed and the whole app "restarted."
+API_TIMEOUT_SECONDS = 45
+SHEETS_TIMEOUT_SECONDS = 10
+
 # The model appends this exact token when (and only when) it asks the final
 # transition question for the CURRENT step. We strip it before displaying
 # and use its presence to move current_step forward.
@@ -209,14 +215,26 @@ def _append_row_blocking(student_id, label, user_text, assistant_text):
 
 
 async def save_transcript_row(label, user_text, assistant_text):
-    """Non-blocking wrapper -- gspread is a synchronous library, so we run it
-    in a worker thread rather than blocking Chainlit's async event loop."""
+    """Fire-and-forget logging -- gspread is a synchronous library, so we run
+    it in a worker thread. Wrapped in its own timeout and its own try/except
+    so a slow or hung Google Sheets call can NEVER stall or crash a
+    student's turn -- logging is a side effect, not part of the critical
+    path. Callers should schedule this with asyncio.create_task(), not
+    await it directly."""
     student_id = cl.user_session.get("student_name") or cl.user_session.get("session_id")
-    success, detail = await asyncio.to_thread(
-        _append_row_blocking, student_id, label, user_text, assistant_text
-    )
-    if not success and detail != "Google Sheets not configured (skipped)":
-        print(f"[transcript save failed] {detail}")
+    try:
+        success, detail = await asyncio.wait_for(
+            asyncio.to_thread(
+                _append_row_blocking, student_id, label, user_text, assistant_text
+            ),
+            timeout=SHEETS_TIMEOUT_SECONDS,
+        )
+        if not success and detail != "Google Sheets not configured (skipped)":
+            print(f"[transcript save failed] {detail}")
+    except asyncio.TimeoutError:
+        print(f"[transcript save timed out after {SHEETS_TIMEOUT_SECONDS}s] label={label}")
+    except Exception as e:
+        print(f"[transcript save crashed] {e}")
 
 
 def strip_advance_marker(text):
@@ -252,7 +270,7 @@ async def main(message: cl.Message):
         cl.user_session.set("student_name", name)
 
         await cl.Message(content=INTRO_MESSAGE, author="Chad Baht").send()
-        await save_transcript_row("Intro", f"Wants to be called: {name}", INTRO_MESSAGE)
+        asyncio.create_task(save_transcript_row("Intro", f"Wants to be called: {name}", INTRO_MESSAGE))
         return
 
     # --- Regular step turn ---
@@ -263,17 +281,26 @@ async def main(message: cl.Message):
     dynamic_system_prompt = BASE_PERSONA + "\n\n" + SCRIPT_STEPS[current_step]
 
     try:
-        response = await client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=MAX_TOKENS,
-            system=dynamic_system_prompt,
-            messages=history,
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=MAX_TOKENS,
+                system=dynamic_system_prompt,
+                messages=history,
+            ),
+            timeout=API_TIMEOUT_SECONDS,
         )
         raw_response = next((b.text for b in response.content if b.type == "text"), "")
         was_truncated = response.stop_reason == "max_tokens"
         full_response, should_advance = strip_advance_marker(raw_response)
         api_call_failed = False
         api_error_detail = None
+    except asyncio.TimeoutError:
+        full_response = API_ERROR_MESSAGE
+        should_advance = False
+        api_call_failed = True
+        api_error_detail = f"Request timed out after {API_TIMEOUT_SECONDS}s"
+        history.pop()
     except Exception as e:
         full_response = API_ERROR_MESSAGE
         should_advance = False
@@ -299,7 +326,7 @@ async def main(message: cl.Message):
         logged_response = full_response
     else:
         logged_response = full_response
-    await save_transcript_row(step_label, prompt, logged_response)
+    asyncio.create_task(save_transcript_row(step_label, prompt, logged_response))
 
     # --- Advance step ---
     if should_advance and not api_call_failed and current_step < TOTAL_STEPS:
